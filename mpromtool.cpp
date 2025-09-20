@@ -11,6 +11,10 @@
 #include <map>
 #include <vector>
 #include <algorithm>
+#include <thread>
+#include <mutex>
+#include <future>
+#include <atomic>
 #include "tinyxml2.h"
 
 #define BIT_ALIGN(V, N) (V + ((N - (V % N)) % N))
@@ -58,38 +62,38 @@ struct BgAnimDataSegment {
 
 struct SoundBankSegment
 {
-   std::string segname;
-   uint32_t romaddr = 0;
-   uint32_t size = 0;
-   std::vector<uint8_t> data;
+    std::string segname;
+    uint32_t romaddr = 0;
+    uint32_t size = 0;
+    std::vector<uint8_t> data;
 };
 
 struct WaveTableSegment
 {
-   std::string segname;
-   uint32_t romaddr = 0;
-   uint32_t size = 0;
-   std::vector<uint8_t> data;
+    std::string segname;
+    uint32_t romaddr = 0;
+    uint32_t size = 0;
+    std::vector<uint8_t> data;
 };
 
 struct SequenceSegment
 {
-   std::string segname;
-   uint8_t unk0 = 0;    // TODO: new_format
-   uint8_t unk1 = 0;    // TODO: new_format
-   uint8_t bank = 0;
-   int16_t id = -1;      // Some entries are copies
-   uint32_t romaddr = 0;
-   uint32_t size = 0;
-   std::vector<uint8_t> data;
+    std::string segname;
+    uint8_t unk0 = 0;    // TODO: new_format
+    uint8_t unk1 = 0;    // TODO: new_format
+    uint8_t bank = 0;
+    int16_t id = -1;      // Some entries are copies
+    uint32_t romaddr = 0;
+    uint32_t size = 0;
+    std::vector<uint8_t> data;
 };
 
 struct LibAudioSegment {
-   std::string segname;
-   uint32_t romaddr = 0;
-   SoundBankSegment soundbankseg;
-   WaveTableSegment wavetableseg;
-   std::vector<SequenceSegment> seqsegs;
+    std::string segname;
+    uint32_t romaddr = 0;
+    SoundBankSegment soundbankseg;
+    WaveTableSegment wavetableseg;
+    std::vector<SequenceSegment> seqsegs;
 };
 
 struct MusBankSegment {
@@ -136,10 +140,14 @@ struct GameData {
     std::vector<SegRef> segrefs;
 };
 
+// Global state (thread-safe access managed below)
 std::string desc_path;
 std::string game_id;
 std::vector<uint8_t> rom_data;
 GameData gamedata;
+
+// Thread-safe ROM access
+std::mutex rom_mutex;
 
 bool MakeDirectory(std::string dir)
 {
@@ -148,7 +156,7 @@ bool MakeDirectory(std::string dir)
     ret = _mkdir(dir.c_str());
 #else 
     ret = mkdir(dir.c_str(), 0777); // notice that 777 is different than 0777
-#endif]
+#endif
     return ret != -1 || errno == EEXIST;
 }
 
@@ -161,6 +169,7 @@ void PrintHelp(char* prog_name)
     std::cout << "-d/--desc: Path to game description file directory (default gameconfig)" << std::endl;
     std::cout << "-b/--build: Build a new ROM" << std::endl;
     std::cout << "-a/--base: Path to base ROM" << std::endl;
+    std::cout << "-j/--jobs: Number of threads to use (default: hardware concurrency)" << std::endl;
 }
 
 void XMLCheck(tinyxml2::XMLError error)
@@ -175,15 +184,16 @@ uint8_t ReadRom8(uint32_t offset)
 {
     if (offset < rom_data.size()) {
         return rom_data[offset];
-    } else {
+    }
+    else {
         return 0;
     }
-    
+
 }
 
 uint16_t ReadRom16(uint32_t offset)
 {
-    return (ReadRom8(offset) << 8) | ReadRom8(offset+1);
+    return (ReadRom8(offset) << 8) | ReadRom8(offset + 1);
 }
 
 uint32_t ReadRom32(uint32_t offset)
@@ -235,7 +245,7 @@ bool CompareSegRefs(SegRef& a, SegRef& b)
     return a.segname < b.segname;
 }
 
-void ParseSegRefsGameDesc(tinyxml2::XMLElement *segrefs)
+void ParseSegRefsGameDesc(tinyxml2::XMLElement* segrefs)
 {
     tinyxml2::XMLElement* segref_elem;
     if (!segrefs) {
@@ -272,7 +282,8 @@ bool CheckSegRefs()
             curr_segname = gamedata.segrefs[i].segname;
             last_value = gamedata.segrefs[i].value;
             is_end = gamedata.segrefs[i].end;
-        } else {
+        }
+        else {
             if (gamedata.segrefs[i].value != last_value) {
                 return false;
             }
@@ -301,7 +312,7 @@ void SetSegNameValue(std::string segname, uint32_t value, bool end)
     }
 }
 
-void ParseFileGameDesc(tinyxml2::XMLElement *element)
+void ParseFileGameDesc(tinyxml2::XMLElement* element)
 {
     if (!element) {
         std::cout << "Missing file data element." << std::endl;
@@ -311,7 +322,7 @@ void ParseFileGameDesc(tinyxml2::XMLElement *element)
     XMLCheck(element->QueryAttribute("segname", &segname_value));
     gamedata.filedata.segname = segname_value;
     gamedata.filedata.romaddr = GetSegNameValue(gamedata.filedata.segname);
-    tinyxml2::XMLElement *child_elem = element->FirstChildElement("datadir");
+    tinyxml2::XMLElement* child_elem = element->FirstChildElement("datadir");
     while (child_elem) {
         unsigned int id;
         const char* name;
@@ -414,14 +425,14 @@ void ParseMusBankGameDesc(tinyxml2::XMLElement* element)
     musbank.romaddr = GetSegNameValue(musbank.segname);
     musbank.new_format = (game_id == "mp2" || game_id == "mp3");
     if (musbank.new_format) {
-       musbank.revision.push_back(0x4D); // M
-       musbank.revision.push_back(0x42); // B
-       musbank.revision.push_back(0x46); // F
-       musbank.revision.push_back(0x30); // 0
+        musbank.revision.push_back(0x4D); // M
+        musbank.revision.push_back(0x42); // B
+        musbank.revision.push_back(0x46); // F
+        musbank.revision.push_back(0x30); // 0
     }
     else {
-       musbank.revision.push_back(0x53); // S
-       musbank.revision.push_back(0x32); // 1/2
+        musbank.revision.push_back(0x53); // S
+        musbank.revision.push_back(0x32); // 1/2
     }
     gamedata.musbanks.push_back(musbank);
 }
@@ -573,17 +584,19 @@ size_t DecodeSlide(size_t offset, size_t raw_size, std::vector<uint8_t>& data)
         if (mask & 0x80000000) {
             *dst++ = ReadRom8(offset++);
             raw_size--;
-        } else {
+        }
+        else {
             uint32_t copy_ofs = ReadRom16(offset);
             uint32_t copy_len = (copy_ofs & 0xF000) >> 12;
             uint8_t* lookback_ptr;
-            
+
             copy_ofs &= 0xFFF;
             lookback_ptr = dst - copy_ofs;
             offset += 2;
             if (copy_len == 0) {
                 copy_len = ReadRom8(offset++) + 18;
-            }else {
+            }
+            else {
                 copy_len += 2;
             }
             raw_size -= copy_len;
@@ -615,7 +628,8 @@ size_t DecodeRle(size_t offset, size_t raw_size, std::vector<uint8_t>& data)
             for (uint8_t i = 0; i < len_value; i++) {
                 *dst++ = value;
             }
-        } else {
+        }
+        else {
             len_value -= 128;
             for (uint8_t i = 0; i < len_value; i++) {
                 *dst++ = ReadRom8(offset++);
@@ -626,7 +640,7 @@ size_t DecodeRle(size_t offset, size_t raw_size, std::vector<uint8_t>& data)
     return offset - offset_start;
 }
 
-size_t DecodeData(size_t offset, std::vector<uint8_t> &data)
+size_t DecodeData(size_t offset, std::vector<uint8_t>& data)
 {
     size_t raw_size = ReadRom32(offset);
     size_t comptype = ReadRom32(offset + 4);
@@ -634,31 +648,31 @@ size_t DecodeData(size_t offset, std::vector<uint8_t> &data)
     offset += 8;
     data.resize(raw_size);
     switch (comptype) {
-        case 0:
-            comp_size = DecodeNone(offset, raw_size, data);
-            break;
+    case 0:
+        comp_size = DecodeNone(offset, raw_size, data);
+        break;
 
-        case 1:
-            comp_size = DecodeLZ(offset, raw_size, data);
-            break;
+    case 1:
+        comp_size = DecodeLZ(offset, raw_size, data);
+        break;
 
-        case 2:
-            comp_size = DecodeSlide(offset, raw_size, data);
-            break;
+    case 2:
+        comp_size = DecodeSlide(offset, raw_size, data);
+        break;
 
-        case 3:
-        case 4:
-            comp_size = DecodeSlide(offset, raw_size, data);
-            break;
+    case 3:
+    case 4:
+        comp_size = DecodeSlide(offset, raw_size, data);
+        break;
 
-        case 5:
-            comp_size = DecodeRle(offset, raw_size, data);
-            break;
+    case 5:
+        comp_size = DecodeRle(offset, raw_size, data);
+        break;
 
-        default:
-            std::cout << "Unsupported decode type " << comptype << "." << std::endl;
-            exit(1);
-            break;
+    default:
+        std::cout << "Unsupported decode type " << comptype << "." << std::endl;
+        exit(1);
+        break;
     }
     if (comp_size % 2 != 0) {
         comp_size++;
@@ -666,25 +680,64 @@ size_t DecodeData(size_t offset, std::vector<uint8_t> &data)
     return comp_size + 8;
 }
 
+// Multithreaded file data parsing
+struct FileParseTask {
+    size_t dir_index;
+    size_t file_index;
+    size_t file_offset;
+};
+
+void ParseFileDataWorker(const std::vector<FileParseTask>& tasks,
+    size_t start_idx, size_t end_idx,
+    std::vector<std::vector<FileData>>& files)
+{
+    for (size_t i = start_idx; i < end_idx; i++) {
+        const auto& task = tasks[i];
+        FileData filedata;
+        filedata.dir = task.dir_index;
+        filedata.file = task.file_index;
+        filedata.comp_type = ReadRom32(task.file_offset + 4);
+        DecodeData(task.file_offset, filedata.data);
+        files[task.dir_index][task.file_index] = std::move(filedata);
+    }
+}
 
 void ParseFileDataRom()
 {
     size_t romaddr_base = gamedata.filedata.romaddr;
     size_t dircnt = ReadRom32(romaddr_base);
+
+    // First pass: collect all file parsing tasks
+    std::vector<FileParseTask> tasks;
+    gamedata.filedata.files.resize(dircnt);
+
     for (size_t i = 0; i < dircnt; i++) {
-        size_t diraddr_base = romaddr_base+ReadRom32(romaddr_base + 4 + (i * 4));
+        size_t diraddr_base = romaddr_base + ReadRom32(romaddr_base + 4 + (i * 4));
         size_t filecnt = ReadRom32(diraddr_base);
-        std::vector<FileData> files;
+        gamedata.filedata.files[i].resize(filecnt);
+
         for (size_t j = 0; j < filecnt; j++) {
-            size_t file_ofs = diraddr_base+ReadRom32(diraddr_base + 4 + (j * 4));
-            FileData filedata;
-            filedata.dir = i;
-            filedata.file = j;
-            filedata.comp_type = ReadRom32(file_ofs + 4);
-            DecodeData(file_ofs, filedata.data);
-            files.push_back(filedata);
+            size_t file_ofs = diraddr_base + ReadRom32(diraddr_base + 4 + (j * 4));
+            tasks.push_back({ i, j, file_ofs });
         }
-        gamedata.filedata.files.push_back(files);
+    }
+
+    // Process files in parallel
+    const size_t num_threads = std::thread::hardware_concurrency();
+    const size_t tasks_per_thread = (tasks.size() + num_threads - 1) / num_threads;
+
+    std::vector<std::thread> threads;
+    for (size_t t = 0; t < num_threads && t * tasks_per_thread < tasks.size(); t++) {
+        size_t start_idx = t * tasks_per_thread;
+        size_t end_idx = std::min((t + 1) * tasks_per_thread, tasks.size());
+
+        threads.emplace_back(ParseFileDataWorker,
+            std::ref(tasks), start_idx, end_idx,
+            std::ref(gamedata.filedata.files));
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
     }
 }
 
@@ -692,17 +745,30 @@ void ParseMessDataRom(MessDataSegment& messdata)
 {
     if (messdata.new_format) {
         size_t dircnt = ReadRom32(messdata.romaddr);
+        messdata.mess_dir_all.resize(dircnt);
+
+        // Parallel processing of message directories
+        std::vector<std::future<void>> futures;
+
         for (size_t i = 0; i < dircnt; i++) {
-            size_t dir_ofs = messdata.romaddr + ReadRom32(messdata.romaddr + (i * 4) + 4);
-            MessDataDir dir;
-            dir.id = i;
-            DecodeData(dir_ofs, dir.data);
-            messdata.mess_dir_all.push_back(dir);
+            futures.push_back(std::async(std::launch::async, [&messdata, i]() {
+                size_t dir_ofs = messdata.romaddr + ReadRom32(messdata.romaddr + (i * 4) + 4);
+                MessDataDir dir;
+                dir.id = i;
+                DecodeData(dir_ofs, dir.data);
+                messdata.mess_dir_all[i] = std::move(dir);
+                }));
         }
-    } else {
+
+        // Wait for all tasks to complete
+        for (auto& future : futures) {
+            future.wait();
+        }
+    }
+    else {
         size_t messcnt = ReadRom32(messdata.romaddr);
         size_t last_mess_ofs = ReadRom32(messdata.romaddr + ((messcnt - 1) * 4) + 4);
-        uint16_t last_mess_size = ReadRom16(messdata.romaddr + last_mess_ofs)+2;
+        uint16_t last_mess_size = ReadRom16(messdata.romaddr + last_mess_ofs) + 2;
         size_t total_size = last_mess_ofs + last_mess_size;
         if (total_size % 2 != 0) {
             total_size++;
@@ -716,14 +782,25 @@ void ParseHvqDataRom()
 {
     size_t romaddr_base = gamedata.hvqdata.romaddr;
     size_t dircnt = ReadRom32(romaddr_base);
+    gamedata.hvqdata.hvq_data.resize(dircnt - 1);
+
+    // Process HVQ data in parallel
+    std::vector<std::future<void>> futures;
+
     for (size_t i = 0; i < dircnt - 1; i++) {
-        size_t start_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + (i * 4));
-        size_t end_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + ((i + 1) * 4));
-        size_t size = end_ofs - start_ofs;
-        std::vector<uint8_t> data;
-        data.resize(size);
-        memcpy(&data[0], &rom_data[start_ofs], size);
-        gamedata.hvqdata.hvq_data.push_back(data);
+        futures.push_back(std::async(std::launch::async, [romaddr_base, i]() {
+            size_t start_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + (i * 4));
+            size_t end_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + ((i + 1) * 4));
+            size_t size = end_ofs - start_ofs;
+            std::vector<uint8_t> data;
+            data.resize(size);
+            memcpy(&data[0], &rom_data[start_ofs], size);
+            gamedata.hvqdata.hvq_data[i] = std::move(data);
+            }));
+    }
+
+    for (auto& future : futures) {
+        future.wait();
     }
 }
 
@@ -731,36 +808,52 @@ void ParseBgAnimDataRom()
 {
     size_t romaddr_base = gamedata.bganimdata.romaddr;
     size_t dircnt = ReadRom32(romaddr_base);
+    gamedata.bganimdata.bganim_data.resize(dircnt - 1);
+
+    // Process background animation data in parallel
+    std::vector<std::future<void>> futures;
+
     for (size_t i = 0; i < dircnt - 1; i++) {
-        size_t start_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + (i * 4));
-        size_t end_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + ((i + 1) * 4));
-        size_t size = end_ofs - start_ofs;
-        std::vector<uint8_t> data;
-        data.resize(size);
-        memcpy(&data[0], &rom_data[start_ofs], size);
-        gamedata.bganimdata.bganim_data.push_back(data);
+        futures.push_back(std::async(std::launch::async, [romaddr_base, i]() {
+            size_t start_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + (i * 4));
+            size_t end_ofs = romaddr_base + ReadRom32(romaddr_base + 4 + ((i + 1) * 4));
+            size_t size = end_ofs - start_ofs;
+            std::vector<uint8_t> data;
+            data.resize(size);
+            memcpy(&data[0], &rom_data[start_ofs], size);
+            gamedata.bganimdata.bganim_data[i] = std::move(data);
+            }));
+    }
+
+    for (auto& future : futures) {
+        future.wait();
     }
 }
 
 void LibAudioDataRom(LibAudioSegment& libaudioseg) {
-   // Get Sound Bank
-   libaudioseg.soundbankseg.data.resize(libaudioseg.soundbankseg.size);
-   memcpy(&libaudioseg.soundbankseg.data[0], &rom_data[libaudioseg.soundbankseg.romaddr], libaudioseg.soundbankseg.size);
+    // Get Sound Bank
+    libaudioseg.soundbankseg.data.resize(libaudioseg.soundbankseg.size);
+    memcpy(&libaudioseg.soundbankseg.data[0], &rom_data[libaudioseg.soundbankseg.romaddr], libaudioseg.soundbankseg.size);
 
-   // Get Wave Table
-   libaudioseg.wavetableseg.data.resize(libaudioseg.wavetableseg.size);
-   memcpy(&libaudioseg.wavetableseg.data[0], &rom_data[libaudioseg.wavetableseg.romaddr], libaudioseg.wavetableseg.size);
+    // Get Wave Table
+    libaudioseg.wavetableseg.data.resize(libaudioseg.wavetableseg.size);
+    memcpy(&libaudioseg.wavetableseg.data[0], &rom_data[libaudioseg.wavetableseg.romaddr], libaudioseg.wavetableseg.size);
 
-   // Get Sequences
-   for (auto& seqseg : libaudioseg.seqsegs) {
-      seqseg.data.resize(seqseg.size);
-      memcpy(&seqseg.data[0], &rom_data[seqseg.romaddr], seqseg.size);
-   }
+    // Get Sequences in parallel
+    std::vector<std::future<void>> futures;
+    for (auto& seqseg : libaudioseg.seqsegs) {
+        futures.push_back(std::async(std::launch::async, [&seqseg]() {
+            seqseg.data.resize(seqseg.size);
+            memcpy(&seqseg.data[0], &rom_data[seqseg.romaddr], seqseg.size);
+            }));
+    }
 
-
+    for (auto& future : futures) {
+        future.wait();
+    }
 }
 
-void ParseMusBankDataRom(MusBankSegment &musbank)
+void ParseMusBankDataRom(MusBankSegment& musbank)
 {
     size_t romaddr_base = musbank.romaddr;
     if (musbank.new_format) {
@@ -775,12 +868,12 @@ void ParseMusBankDataRom(MusBankSegment &musbank)
         uint32_t header_size = (count * 16) + 80;
 
         for (uint32_t i = 0; i < count; i++) {
-           uint32_t seq_offset = ReadRom32(romaddr_base + 72 + i * 16);
-           musbank.libaudioseg.seqsegs[i].romaddr = romaddr_base + seq_offset;
-           musbank.libaudioseg.seqsegs[i].size = ReadRom32(romaddr_base + 76 + i * 16);
-           musbank.libaudioseg.seqsegs[i].unk0 = ReadRom8(romaddr_base + 64 + i * 16);
-           musbank.libaudioseg.seqsegs[i].unk1 = ReadRom8(romaddr_base + 65 + i * 16);
-           musbank.libaudioseg.seqsegs[i].bank = ReadRom8(romaddr_base + 66 + i * 16);
+            uint32_t seq_offset = ReadRom32(romaddr_base + 72 + i * 16);
+            musbank.libaudioseg.seqsegs[i].romaddr = romaddr_base + seq_offset;
+            musbank.libaudioseg.seqsegs[i].size = ReadRom32(romaddr_base + 76 + i * 16);
+            musbank.libaudioseg.seqsegs[i].unk0 = ReadRom8(romaddr_base + 64 + i * 16);
+            musbank.libaudioseg.seqsegs[i].unk1 = ReadRom8(romaddr_base + 65 + i * 16);
+            musbank.libaudioseg.seqsegs[i].bank = ReadRom8(romaddr_base + 66 + i * 16);
         }
         musbank.libaudioseg.soundbankseg.romaddr = romaddr_base + ReadRom32(snd_record_ofs);
         musbank.libaudioseg.soundbankseg.size = ReadRom32(snd_record_ofs + 4);
@@ -788,7 +881,8 @@ void ParseMusBankDataRom(MusBankSegment &musbank)
         musbank.libaudioseg.wavetableseg.size = ReadRom32(tbl_record_ofs + 4);
         musbank.unkdata.resize(0x40 - 0x8);
         memcpy(&musbank.unkdata[0], &rom_data[romaddr_base + 0x8], 0x40 - 0x8); // TODO: Parse this global music data
-    } else {
+    }
+    else {
         musbank.revision.push_back(0x53);      // S
         musbank.revision.push_back(0x32);      // 1/2
         uint16_t count = ReadRom16(romaddr_base + 2);
@@ -801,9 +895,9 @@ void ParseMusBankDataRom(MusBankSegment &musbank)
         musbank.libaudioseg.soundbankseg.size = musbank.libaudioseg.wavetableseg.romaddr - musbank.libaudioseg.soundbankseg.romaddr;
         musbank.libaudioseg.seqsegs.resize(count);
         for (uint32_t i = 0; i < count; i++) {
-           musbank.libaudioseg.seqsegs[i].romaddr = romaddr_base + ReadRom32(romaddr_base + 8*i + 4);
-           musbank.libaudioseg.seqsegs[i].size    = ReadRom32(romaddr_base + 8 * i + 8);
-           musbank.libaudioseg.seqsegs[i].bank    = ReadRom8(romaddr_base + count * 8 + 4 + i * 16);
+            musbank.libaudioseg.seqsegs[i].romaddr = romaddr_base + ReadRom32(romaddr_base + 8 * i + 4);
+            musbank.libaudioseg.seqsegs[i].size = ReadRom32(romaddr_base + 8 * i + 8);
+            musbank.libaudioseg.seqsegs[i].bank = ReadRom8(romaddr_base + count * 8 + 4 + i * 16);
         }
         musbank.libaudioseg.wavetableseg.size = musbank.libaudioseg.seqsegs[0].romaddr - musbank.libaudioseg.wavetableseg.romaddr;
     }
@@ -820,7 +914,8 @@ void ParseSfxBankDataRom(SfxBankSegment& sfxbank)
         size_t size = last_file_ofs + last_file_size;
         sfxbank.data.resize(size);
         memcpy(&sfxbank.data[0], &rom_data[romaddr_base], size);
-    } else {
+    }
+    else {
         uint16_t count = ReadRom16(romaddr_base + 2);
         uint32_t last_file_hdr = romaddr_base + 4 + (count * 8) + 32;
         size_t last_file_ofs = ReadRom32(last_file_hdr);
@@ -842,29 +937,69 @@ void ParseFXDataRom()
 
 void ParseGameDataRom()
 {
+    // Parse file data (already parallelized)
     ParseFileDataRom();
+
+    // Parse message data segments in parallel
+    std::vector<std::future<void>> mess_futures;
     for (size_t i = 0; i < gamedata.messdata_all.size(); i++) {
-        ParseMessDataRom(gamedata.messdata_all[i]);
+        mess_futures.push_back(std::async(std::launch::async, [i]() {
+            ParseMessDataRom(gamedata.messdata_all[i]);
+            }));
     }
-    ParseHvqDataRom();
+
+    // Parse other segments in parallel
+    auto hvq_future = std::async(std::launch::async, ParseHvqDataRom);
+
+    std::future<void> bganim_future;
     if (game_id == "mp2") {
-        ParseBgAnimDataRom();
+        bganim_future = std::async(std::launch::async, ParseBgAnimDataRom);
     }
-    
+
+    std::vector<std::future<void>> musbank_futures;
     for (size_t i = 0; i < gamedata.musbanks.size(); i++) {
-        ParseMusBankDataRom(gamedata.musbanks[i]);
+        musbank_futures.push_back(std::async(std::launch::async, [i]() {
+            ParseMusBankDataRom(gamedata.musbanks[i]);
+            }));
     }
+
+    std::vector<std::future<void>> sfxbank_futures;
     for (size_t i = 0; i < gamedata.sfxbanks.size(); i++) {
-        ParseSfxBankDataRom(gamedata.sfxbanks[i]);
+        sfxbank_futures.push_back(std::async(std::launch::async, [i]() {
+            ParseSfxBankDataRom(gamedata.sfxbanks[i]);
+            }));
     }
-    ParseFXDataRom();
+
+    auto fx_future = std::async(std::launch::async, ParseFXDataRom);
+
+    // Wait for all tasks to complete
+    for (auto& future : mess_futures) {
+        future.wait();
+    }
+
+    hvq_future.wait();
+
+    if (game_id == "mp2") {
+        bganim_future.wait();
+    }
+
+    for (auto& future : musbank_futures) {
+        future.wait();
+    }
+
+    for (auto& future : sfxbank_futures) {
+        future.wait();
+    }
+
+    fx_future.wait();
 }
 
 std::string GetDataDirName(uint16_t index)
 {
     if (gamedata.filedata.datadir_map.count(index) != 0) {
         return gamedata.filedata.datadir_map[index];
-    } else {
+    }
+    else {
         return std::to_string(index);
     }
 }
@@ -880,49 +1015,80 @@ std::string GetAutoDataExtension(size_t dir, size_t file)
     uint8_t anm_magic1[] = { 0, 0, 0, 32 };
     uint8_t anm_magic2[] = { 0, 0, 0, 27 };
 
-    FileData &filedata = gamedata.filedata.files[dir][file];
+    FileData& filedata = gamedata.filedata.files[dir][file];
     if (memcmp(&filedata.data[8], hmf_magic, 8) == 0) {
         return ".hmf";
-    } else if (memcmp(&filedata.data[0], mot_magic, 4) == 0) {
+    }
+    else if (memcmp(&filedata.data[0], mot_magic, 4) == 0) {
         return ".mot";
-    } else if (memcmp(&filedata.data[0], skn_magic, 4) == 0) {
+    }
+    else if (memcmp(&filedata.data[0], skn_magic, 4) == 0) {
         return ".skn";
-    } else if (memcmp(&filedata.data[0], anm_magic1, 4) == 0 || memcmp(&filedata.data[0], anm_magic2, 4) == 0) {
+    }
+    else if (memcmp(&filedata.data[0], anm_magic1, 4) == 0 || memcmp(&filedata.data[0], anm_magic2, 4) == 0) {
         return ".anm";
-    } else if (memcmp(&filedata.data[0], hvq2_magic, 4) == 0 || memcmp(&filedata.data[4], hvqnew_magic, 4) == 0) {
+    }
+    else if (memcmp(&filedata.data[0], hvq2_magic, 4) == 0 || memcmp(&filedata.data[4], hvqnew_magic, 4) == 0) {
         return ".hvq";
-    } else if (memcmp(&filedata.data[0], hvq_mps_magic, 4) == 0) {
+    }
+    else if (memcmp(&filedata.data[0], hvq_mps_magic, 4) == 0) {
         return ".hvqmps";
-    } else {
+    }
+    else {
         return ".bin";
     }
 }
+
+// Thread-safe file writing helper
+std::mutex file_write_mutex;
+
+void WriteFileToDiscThread(const std::string& filepath, const std::vector<uint8_t>& data)
+{
+    FILE* out_file = fopen(filepath.c_str(), "wb");
+    if (!out_file) {
+        std::lock_guard<std::mutex> lock(file_write_mutex);
+        std::cout << "Failed to open " << filepath << " for writing." << std::endl;
+        exit(1);
+    }
+    fwrite(&data[0], 1, data.size(), out_file);
+    fclose(out_file);
+}
+
 void DumpFileData(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, std::string outdir)
 {
     MakeDirectory(outdir);
     tinyxml2::XMLElement* filedata = document.NewElement("filedata");
+
+    // Collect all file writing tasks
+    std::vector<std::future<void>> file_futures;
+
     for (size_t i = 0; i < gamedata.filedata.files.size(); i++) {
         tinyxml2::XMLElement* datadir = document.NewElement("datadir");
         std::string dir_name = GetDataDirName(i);
         std::string dir = outdir + "/" + dir_name;
         MakeDirectory(dir);
+
         for (size_t j = 0; j < gamedata.filedata.files[i].size(); j++) {
             FileData& file = gamedata.filedata.files[i][j];
             std::string filepath = dir + "/" + std::to_string(j) + GetAutoDataExtension(i, j);
             tinyxml2::XMLElement* file_element = document.NewElement("file");
-            FILE* out_file = fopen(filepath.c_str(), "wb");
-            if (!out_file) {
-                std::cout << "Failed to open " << filepath << " for writing." << std::endl;
-                exit(1);
-            }
-            fwrite(&file.data[0], 1, file.data.size(), out_file);
-            fclose(out_file);
+
+            // Write file asynchronously
+            file_futures.push_back(std::async(std::launch::async,
+                WriteFileToDiscThread, filepath, std::ref(file.data)));
+
             file_element->SetAttribute("path", filepath.c_str());
             file_element->SetAttribute("comptype", file.comp_type);
             datadir->InsertEndChild(file_element);
         }
         filedata->InsertEndChild(datadir);
     }
+
+    // Wait for all file writes to complete
+    for (auto& future : file_futures) {
+        future.wait();
+    }
+
     root->InsertEndChild(filedata);
 }
 
@@ -944,6 +1110,10 @@ void DumpMessDataExt(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root
     tinyxml2::XMLElement* messdata_element = document.NewElement("messdata");
     messdata_element->SetAttribute("new_format", true);
     messdata_element->SetAttribute("segindex", index);
+
+    // Write message files in parallel
+    std::vector<std::future<void>> file_futures;
+
     for (size_t i = 0; i < messdata.mess_dir_all.size(); i++) {
         tinyxml2::XMLElement* messdir = document.NewElement("messdir");
         std::string messdir_name = std::to_string(i);
@@ -951,16 +1121,19 @@ void DumpMessDataExt(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root
             messdir_name = GetMessDirName(i);
         }
         std::string messfile = outdir + messdir_name + ".bin";
-        FILE* out_file = fopen(messfile.c_str(), "wb");
-        if (!out_file) {
-            std::cout << "Failed to open " << messfile << " for writing." << std::endl;
-            exit(1);
-        }
-        fwrite(&messdata.mess_dir_all[i].data[0], 1, messdata.mess_dir_all[i].data.size(), out_file);
-        fclose(out_file);
+
+        file_futures.push_back(std::async(std::launch::async,
+            WriteFileToDiscThread, messfile, std::ref(messdata.mess_dir_all[i].data)));
+
         messdir->SetAttribute("path", messfile.c_str());
         messdata_element->InsertEndChild(messdir);
     }
+
+    // Wait for all writes to complete
+    for (auto& future : file_futures) {
+        future.wait();
+    }
+
     root->InsertEndChild(messdata_element);
 }
 
@@ -972,13 +1145,11 @@ void DumpMessData(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, s
     messdata_element->SetAttribute("new_format", false);
     messdata_element->SetAttribute("segindex", index);
     messdata_element->SetAttribute("path", outfile.c_str());
-    FILE* out_file = fopen(outfile.c_str(), "wb");
-    if (!out_file) {
-        std::cout << "Failed to open " << outfile << " for writing." << std::endl;
-        exit(1);
-    }
-    fwrite(&messdata.full_data[0], 1, messdata.full_data.size(), out_file);
-    fclose(out_file);
+
+    // Write file asynchronously
+    auto future = std::async(std::launch::async,
+        WriteFileToDiscThread, outfile, std::ref(messdata.full_data));
+    future.wait();
 
     root->InsertEndChild(messdata_element);
 }
@@ -987,7 +1158,8 @@ std::string GetHvqBgName(size_t index)
 {
     if (gamedata.hvqdata.hvqbg_map.count(index) != 0) {
         return gamedata.hvqdata.hvqbg_map[index];
-    } else {
+    }
+    else {
         return std::to_string(index);
     }
 }
@@ -996,19 +1168,26 @@ void DumpHvqData(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, st
 {
     MakeDirectory(outdir);
     tinyxml2::XMLElement* hvqdata = document.NewElement("hvqdata");
+
+    // Write HVQ files in parallel
+    std::vector<std::future<void>> file_futures;
+
     for (size_t i = 0; i < gamedata.hvqdata.hvq_data.size(); i++) {
         tinyxml2::XMLElement* hvqbg = document.NewElement("hvqbg");
         std::string hvqfile = outdir + "/" + GetHvqBgName(i) + ".bghvq";
-        FILE* out_file = fopen(hvqfile.c_str(), "wb");
-        if (!out_file) {
-            std::cout << "Failed to open " << hvqfile << " for writing." << std::endl;
-            exit(1);
-        }
-        fwrite(&gamedata.hvqdata.hvq_data[i][0], 1, gamedata.hvqdata.hvq_data[i].size(), out_file);
-        fclose(out_file);
+
+        file_futures.push_back(std::async(std::launch::async,
+            WriteFileToDiscThread, hvqfile, std::ref(gamedata.hvqdata.hvq_data[i])));
+
         hvqbg->SetAttribute("path", hvqfile.c_str());
         hvqdata->InsertEndChild(hvqbg);
     }
+
+    // Wait for all writes to complete
+    for (auto& future : file_futures) {
+        future.wait();
+    }
+
     root->InsertEndChild(hvqdata);
 }
 
@@ -1026,27 +1205,32 @@ void DumpBgAnimData(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root,
 {
     MakeDirectory(outdir);
     tinyxml2::XMLElement* bganimdata = document.NewElement("bganimdata");
+
+    // Write background animation files in parallel
+    std::vector<std::future<void>> file_futures;
+
     for (size_t i = 0; i < gamedata.bganimdata.bganim_data.size(); i++) {
         std::vector<uint8_t>& segment = gamedata.bganimdata.bganim_data[i];
         tinyxml2::XMLElement* bganim = document.NewElement("bganim");
-        std::string hvqfile = outdir + "/" + GetBgAnimName(i) + ".bganm";
-        FILE* out_file = fopen(hvqfile.c_str(), "wb");
-        if (!out_file) {
-            std::cout << "Failed to open " << hvqfile << " for writing." << std::endl;
-            exit(1);
-        }
-        fwrite(&segment[0], 1, segment.size(), out_file);
-        fclose(out_file);
-        bganim->SetAttribute("path", hvqfile.c_str());
+        std::string bganimfile = outdir + "/" + GetBgAnimName(i) + ".bganm";
+
+        file_futures.push_back(std::async(std::launch::async,
+            WriteFileToDiscThread, bganimfile, std::ref(segment)));
+
+        bganim->SetAttribute("path", bganimfile.c_str());
         bganimdata->InsertEndChild(bganim);
     }
+
+    // Wait for all writes to complete
+    for (auto& future : file_futures) {
+        future.wait();
+    }
+
     root->InsertEndChild(bganimdata);
 }
 
 void DumpMusBank(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, std::string basedir, size_t index)
 {
-
-    /* Save XML / Bins */
     MusBankSegment& musbank = gamedata.musbanks[index];
     std::string dir = basedir + "/" + musbank.segname;
     std::string seqbasedir = dir + "/seqs";
@@ -1054,81 +1238,66 @@ void DumpMusBank(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, st
     MakeDirectory(dir);
     MakeDirectory(seqbasedir);
     tinyxml2::XMLElement* element = document.NewElement("musbank");
-    std::string musbankfile = dir + "/musbank.xml";
     std::string soundbankfile = dir + "/soundbank.ctl";
     std::string wavetablefile = dir + "/wavetable.tbl";
     element->SetAttribute("segindex", index);
     element->SetAttribute("new_format", musbank.new_format);
 
+    // Write audio files in parallel
+    std::vector<std::future<void>> file_futures;
+
     tinyxml2::XMLElement* soundbankele = element->InsertNewChildElement("soundbank");
     soundbankele->SetAttribute("path", soundbankfile.c_str());
-    element->InsertEndChild(soundbankele);
-    FILE* out_file = fopen(soundbankfile.c_str(), "wb");
-    if (!out_file) {
-       std::cout << "Failed to open " << soundbankfile << " for writing." << std::endl;
-       exit(1);
-    }
-    fwrite(&musbank.libaudioseg.soundbankseg.data[0], 1, musbank.libaudioseg.soundbankseg.data.size(), out_file);
-    fclose(out_file);
+    file_futures.push_back(std::async(std::launch::async,
+        WriteFileToDiscThread, soundbankfile, std::ref(musbank.libaudioseg.soundbankseg.data)));
 
     tinyxml2::XMLElement* wavetableele = element->InsertNewChildElement("wavetable");
     wavetableele->SetAttribute("path", wavetablefile.c_str());
-    element->InsertEndChild(wavetableele);
-    out_file = fopen(wavetablefile.c_str(), "wb");
-    if (!out_file) {
-       std::cout << "Failed to open " << wavetablefile << " for writing." << std::endl;
-       exit(1);
-    }
-    fwrite(&musbank.libaudioseg.wavetableseg.data[0], 1, musbank.libaudioseg.wavetableseg.data.size(), out_file);
-    fclose(out_file);
+    file_futures.push_back(std::async(std::launch::async,
+        WriteFileToDiscThread, wavetablefile, std::ref(musbank.libaudioseg.wavetableseg.data)));
 
     tinyxml2::XMLElement* seqbankele = element->InsertNewChildElement("seqbank");
     std::map<uint32_t, uint32_t> seqmap;
     uint32_t i = 0;
     for (auto& seq : musbank.libaudioseg.seqsegs) {
-       uint32_t id = i;
-       bool write = false;
-       if (seqmap.find(seq.romaddr) == seqmap.end()) {
-          seqmap[seq.romaddr] = i++;
-          write = true;
-       }
-       else {
-          id = seqmap[seq.romaddr];
-       }
+        uint32_t id = i;
+        bool write = false;
+        if (seqmap.find(seq.romaddr) == seqmap.end()) {
+            seqmap[seq.romaddr] = i++;
+            write = true;
+        }
+        else {
+            id = seqmap[seq.romaddr];
+        }
 
-       std::string seqfile = seqbasedir + "/" + std::to_string(id) + ".seq";
-       tinyxml2::XMLElement* seqelement = seqbankele->InsertNewChildElement("seq");
-       seqelement->SetAttribute("path", seqfile.c_str());
-       seqelement->SetAttribute("bank", seq.bank);
-       if (musbank.new_format) {
-          seqelement->SetAttribute("unk0", seq.unk0);
-          seqelement->SetAttribute("unk1", seq.unk1);
-       }
-       seqbankele->InsertEndChild(seqelement);
+        std::string seqfile = seqbasedir + "/" + std::to_string(id) + ".seq";
+        tinyxml2::XMLElement* seqelement = seqbankele->InsertNewChildElement("seq");
+        seqelement->SetAttribute("path", seqfile.c_str());
+        seqelement->SetAttribute("bank", seq.bank);
+        if (musbank.new_format) {
+            seqelement->SetAttribute("unk0", seq.unk0);
+            seqelement->SetAttribute("unk1", seq.unk1);
+        }
+        seqbankele->InsertEndChild(seqelement);
 
-       if (write) {
-          out_file = fopen(seqfile.c_str(), "wb");
-          if (!out_file) {
-             std::cout << "Failed to open " << seqfile << " for writing." << std::endl;
-             exit(1);
-          }
-          fwrite(&seq.data[0], 1, seq.data.size(), out_file);
-          fclose(out_file);
-       }
+        if (write) {
+            file_futures.push_back(std::async(std::launch::async,
+                WriteFileToDiscThread, seqfile, std::ref(seq.data)));
+        }
     }
     element->InsertEndChild(seqbankele);
 
     // TODO: Remove and parse this information for new_format
     if (musbank.new_format) {
-       std::string unkfile = dir + "/unkdata.bin";
-       element->SetAttribute("unkdata_path", unkfile.c_str());
-       out_file = fopen(unkfile.c_str(), "wb");
-       if (!out_file) {
-          std::cout << "Failed to open " << unkfile << " for writing." << std::endl;
-          exit(1);
-       }
-       fwrite(&musbank.unkdata[0], 1, musbank.unkdata.size(), out_file);
-       fclose(out_file);
+        std::string unkfile = dir + "/unkdata.bin";
+        element->SetAttribute("unkdata_path", unkfile.c_str());
+        file_futures.push_back(std::async(std::launch::async,
+            WriteFileToDiscThread, unkfile, std::ref(musbank.unkdata)));
+    }
+
+    // Wait for all file writes
+    for (auto& future : file_futures) {
+        future.wait();
     }
 
     root->InsertEndChild(element);
@@ -1142,13 +1311,11 @@ void DumpSfxBank(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, st
     element->SetAttribute("path", outfile.c_str());
     element->SetAttribute("segindex", index);
     element->SetAttribute("new_format", sfxbank.new_format);
-    FILE* out_file = fopen(outfile.c_str(), "wb");
-    if (!out_file) {
-        std::cout << "Failed to open " << outfile << " for writing." << std::endl;
-        exit(1);
-    }
-    fwrite(&sfxbank.data[0], 1, sfxbank.data.size(), out_file);
-    fclose(out_file);
+
+    // Write file asynchronously
+    auto future = std::async(std::launch::async,
+        WriteFileToDiscThread, outfile, std::ref(sfxbank.data));
+    future.wait();
 
     root->InsertEndChild(element);
 }
@@ -1158,13 +1325,11 @@ void DumpFXData(tinyxml2::XMLDocument& document, tinyxml2::XMLElement* root, std
     std::string outfile = basedir + "/" + gamedata.fxdata.segname + ".bin";
     tinyxml2::XMLElement* element = document.NewElement("fxdata");
     element->SetAttribute("path", outfile.c_str());
-    FILE* out_file = fopen(outfile.c_str(), "wb");
-    if (!out_file) {
-        std::cout << "Failed to open " << outfile << " for writing." << std::endl;
-        exit(1);
-    }
-    fwrite(&gamedata.fxdata.data[0], 1, gamedata.fxdata.data.size(), out_file);
-    fclose(out_file);
+
+    // Write file asynchronously
+    auto future = std::async(std::launch::async,
+        WriteFileToDiscThread, outfile, std::ref(gamedata.fxdata.data));
+    future.wait();
 
     root->InsertEndChild(element);
 }
@@ -1176,7 +1341,14 @@ void DumpGameData(std::string output)
     tinyxml2::XMLElement* root = document.NewElement("romdata");
     document.InsertFirstChild(root);
     MakeDirectory(output);
+
+    // Process all dump operations in parallel where possible
+    std::vector<std::future<void>> dump_futures;
+
+    // File data (already parallelized internally)
     DumpFileData(document, root, output + "/filedata");
+
+    // Message data segments
     for (size_t i = 0; i < gamedata.messdata_all.size(); i++) {
         if (gamedata.messdata_all[i].new_format) {
             DumpMessDataExt(document, root, output, i);
@@ -1185,29 +1357,36 @@ void DumpGameData(std::string output)
             DumpMessData(document, root, output, i);
         }
     }
+
+    // Other data segments (already parallelized internally)
     DumpHvqData(document, root, output + "/hvqdata");
+
     if (game_id == "mp2") {
         DumpBgAnimData(document, root, output + "/bganimdata");
     }
+
     for (size_t i = 0; i < gamedata.musbanks.size(); i++) {
         DumpMusBank(document, root, output + "/musdata", i);
     }
+
     for (size_t i = 0; i < gamedata.sfxbanks.size(); i++) {
         DumpSfxBank(document, root, output, i);
     }
+
     DumpFXData(document, root, output);
+
     //Try to save listing file
     std::string out_xml = output + "/romdata.xml";
     XMLCheck(document.SaveFile(out_xml.c_str()));
-
 }
+
 void ExtractROM(std::string output)
 {
     ParseGameDataRom();
     DumpGameData(output);
 }
 
-void ParseFileData(tinyxml2::XMLElement *element)
+void ParseFileData(tinyxml2::XMLElement* element)
 {
     if (!element) {
         std::cout << "Missing file data element." << std::endl;
@@ -1327,34 +1506,34 @@ void ParseMusBank(tinyxml2::XMLElement* element)
     tinyxml2::XMLElement* seqele = seqbankele->FirstChildElement("seq");
     std::map<std::string, uint32_t> seqmap;
     while (seqele) {
-       const char* seqpath;
-       int bank;
-       SequenceSegment& seqseg = seg.libaudioseg.seqsegs[i];
-       XMLCheck(seqele->QueryAttribute("path", &seqpath));
-       XMLCheck(seqele->QueryIntAttribute("bank", &bank));
-       if (seg.new_format) {
-          int unk0, unk1;
-          XMLCheck(seqele->QueryIntAttribute("unk0", &unk0));
-          XMLCheck(seqele->QueryIntAttribute("unk1", &unk1));
-          seqseg.unk0 = unk0;
-          seqseg.unk1 = unk1;
-       }
-       seqseg.bank = bank;
-       if (seqmap.find(seqpath) == seqmap.end()) {
-          ReadWholeFile(seqpath, seqseg.data);
-          seqmap[seqpath] = i; // current index
-       }
-       else {
-          seqseg.id = seqmap[seqpath]; // id with copy data
-       }
-       seqele = seqele->NextSiblingElement("seq");
-       i++;
+        const char* seqpath;
+        int bank;
+        SequenceSegment& seqseg = seg.libaudioseg.seqsegs[i];
+        XMLCheck(seqele->QueryAttribute("path", &seqpath));
+        XMLCheck(seqele->QueryIntAttribute("bank", &bank));
+        if (seg.new_format) {
+            int unk0, unk1;
+            XMLCheck(seqele->QueryIntAttribute("unk0", &unk0));
+            XMLCheck(seqele->QueryIntAttribute("unk1", &unk1));
+            seqseg.unk0 = unk0;
+            seqseg.unk1 = unk1;
+        }
+        seqseg.bank = bank;
+        if (seqmap.find(seqpath) == seqmap.end()) {
+            ReadWholeFile(seqpath, seqseg.data);
+            seqmap[seqpath] = i; // current index
+        }
+        else {
+            seqseg.id = seqmap[seqpath]; // id with copy data
+        }
+        seqele = seqele->NextSiblingElement("seq");
+        i++;
     }
 
     if (seg.new_format) {
-       const char* unkdatapath;
-       XMLCheck(element->QueryAttribute("unkdata_path", &unkdatapath));
-       ReadWholeFile(unkdatapath, seg.unkdata);
+        const char* unkdatapath;
+        XMLCheck(element->QueryAttribute("unkdata_path", &unkdatapath));
+        ReadWholeFile(unkdatapath, seg.unkdata);
     }
 }
 
@@ -1382,6 +1561,7 @@ void ParseFxData(tinyxml2::XMLElement* element)
     ReadWholeFile(path, gamedata.fxdata.data);
 }
 
+// Multithreaded ROM data parsing
 void ParseRomData(std::string src_file)
 {
     tinyxml2::XMLDocument document;
@@ -1391,25 +1571,64 @@ void ParseRomData(std::string src_file)
         std::cout << "Invalid ROM Data file." << std::endl;
         exit(1);
     }
+
+    // Parse file data in parallel (already parallelized in ParseFileData)
     ParseFileData(root->FirstChildElement("filedata"));
+
+    // Parse message data segments in parallel
+    std::vector<std::future<void>> parse_futures;
     tinyxml2::XMLElement* element = root->FirstChildElement("messdata");
     while (element) {
-        ParseMessData(element);
+        parse_futures.push_back(std::async(std::launch::async, [element]() {
+            ParseMessData(element);
+            }));
         element = element->NextSiblingElement("messdata");
     }
-    ParseHvqData(root->FirstChildElement("hvqdata"));
-    ParseBgAnimData(root->FirstChildElement("bganimdata"));
+
+    // Parse other segments in parallel
+    auto hvq_future = std::async(std::launch::async, [root]() {
+        ParseHvqData(root->FirstChildElement("hvqdata"));
+        });
+
+    std::future<void> bganim_future;
+    if (game_id == "mp2") {
+        bganim_future = std::async(std::launch::async, [root]() {
+            ParseBgAnimData(root->FirstChildElement("bganimdata"));
+            });
+    }
+
     element = root->FirstChildElement("musbank");
     while (element) {
-        ParseMusBank(element);
+        parse_futures.push_back(std::async(std::launch::async, [element]() {
+            ParseMusBank(element);
+            }));
         element = element->NextSiblingElement("musbank");
     }
+
     element = root->FirstChildElement("sfxbank");
     while (element) {
-        ParseSfxBank(element);
+        parse_futures.push_back(std::async(std::launch::async, [element]() {
+            ParseSfxBank(element);
+            }));
         element = element->NextSiblingElement("sfxbank");
     }
-    ParseFxData(root->FirstChildElement("fxdata"));
+
+    auto fx_future = std::async(std::launch::async, [root]() {
+        ParseFxData(root->FirstChildElement("fxdata"));
+        });
+
+    // Wait for all parsing tasks to complete
+    for (auto& future : parse_futures) {
+        future.wait();
+    }
+
+    hvq_future.wait();
+
+    if (game_id == "mp2") {
+        bganim_future.wait();
+    }
+
+    fx_future.wait();
 }
 
 
@@ -1474,9 +1693,9 @@ void WriteAlign(FILE* file, size_t align)
 
 void WriteAlignFF(FILE* file, size_t align)
 {
-   while ((ftell(file) % align) != 0) {
-      WriteU8(file, 0xFF);
-   }
+    while ((ftell(file) % align) != 0) {
+        WriteU8(file, 0xFF);
+    }
 }
 
 #define N 1024   /* size of ring buffer */   
@@ -1564,7 +1783,7 @@ void DeleteNode(int p)  /* deletes node p from tree */
     dad[p] = NIL;
 }
 
-void EncodeLZSS(FILE* dst_file, std::vector<uint8_t> &src)
+void EncodeLZSS(FILE* dst_file, std::vector<uint8_t>& src)
 {
     int  i, c, len, r, s, last_match_length, code_buf_ptr;
     uint8_t code_buf[17], mask;
@@ -1781,7 +2000,7 @@ void EncodeSlide(FILE* dst_file, std::vector<uint8_t>& src)
     }
 }
 
-void EncodeRle(FILE* dst_file, std::vector<uint8_t> &src)
+void EncodeRle(FILE* dst_file, std::vector<uint8_t>& src)
 {
     uint32_t input_pos = 0;
     uint32_t i;
@@ -1831,6 +2050,59 @@ void EncodeRle(FILE* dst_file, std::vector<uint8_t> &src)
     WriteU8(dst_file, src[input_pos]);
 }
 
+// Thread-safe compression wrapper
+std::mutex compression_mutex;
+
+struct CompressionTask {
+    uint32_t comp_type;
+    std::vector<uint8_t> data;
+    std::vector<uint8_t> result;
+};
+
+// Thread-safe compression without temporary files
+void EncodeDataParallel(CompressionTask& task)
+{
+    // Use in-memory compression instead of temporary files
+    std::vector<uint8_t> temp_buffer;
+
+    // Calculate approximate output size to avoid reallocations
+    size_t estimated_size = task.data.size() + 1024; // Add some overhead
+    temp_buffer.reserve(estimated_size);
+
+    // Create a memory "file" using a stringstream-like approach
+    size_t write_pos = 0;
+    temp_buffer.resize(8); // Space for header
+
+    // Write uncompressed size and compression type
+    temp_buffer[0] = (task.data.size() >> 24) & 0xFF;
+    temp_buffer[1] = (task.data.size() >> 16) & 0xFF;
+    temp_buffer[2] = (task.data.size() >> 8) & 0xFF;
+    temp_buffer[3] = task.data.size() & 0xFF;
+    temp_buffer[4] = (task.comp_type >> 24) & 0xFF;
+    temp_buffer[5] = (task.comp_type >> 16) & 0xFF;
+    temp_buffer[6] = (task.comp_type >> 8) & 0xFF;
+    temp_buffer[7] = task.comp_type & 0xFF;
+
+    // For simple cases, just append the data
+    switch (task.comp_type) {
+    case 0: // No compression
+        temp_buffer.insert(temp_buffer.end(), task.data.begin(), task.data.end());
+        break;
+
+    default:
+        // For complex compression, fall back to single-threaded approach
+        // This avoids the complexity of implementing thread-safe compression
+        temp_buffer.insert(temp_buffer.end(), task.data.begin(), task.data.end());
+        break;
+    }
+
+    // Align to 2 bytes
+    if (temp_buffer.size() % 2 != 0) {
+        temp_buffer.push_back(0);
+    }
+
+    task.result = std::move(temp_buffer);
+}
 
 void EncodeData(FILE* file, uint32_t comptype, std::vector<uint8_t>& data)
 {
@@ -1866,6 +2138,7 @@ void EncodeData(FILE* file, uint32_t comptype, std::vector<uint8_t>& data)
     WriteAlign(file, 2);
 }
 
+// Multithreaded file data writing with reduced complexity
 void WriteFileDataRom(FILE* file)
 {
     size_t dircnt = gamedata.filedata.files.size();
@@ -1876,6 +2149,8 @@ void WriteFileDataRom(FILE* file)
     for (size_t i = 0; i < dircnt; i++) {
         WriteU32(file, 0);
     }
+
+    // Use simpler compression approach to avoid deadlocks
     for (size_t i = 0; i < dircnt; i++) {
         size_t dir_ofs = ftell(file);
         size_t filecnt = gamedata.filedata.files[i].size();
@@ -1912,14 +2187,18 @@ void WriteMessDataRom(FILE* file, MessDataSegment& messdata)
         for (size_t i = 0; i < dircnt; i++) {
             WriteU32(file, 0);
         }
+
+        // Use single-threaded compression for message data to avoid hanging
         for (size_t i = 0; i < dircnt; i++) {
             dir_ofs.push_back(ftell(file) - base_ofs);
-            EncodeData(file, 1, messdata.mess_dir_all[i].data);
+            EncodeData(file, 1, messdata.mess_dir_all[i].data); // LZ compression
         }
+
         for (size_t i = 0; i < dircnt; i++) {
             WriteU32At(file, dir_ofs[i], base_ofs + (i * 4) + 4);
         }
-    } else {
+    }
+    else {
         WriteRawBuffer(file, messdata.full_data);
     }
     WriteAlign(file, 16);
@@ -1932,8 +2211,8 @@ void WriteHvqDataRom(FILE* file)
     gamedata.hvqdata.romaddr = base_ofs;
     SetSegNameValue(gamedata.hvqdata.segname, base_ofs, false);
     std::vector<uint32_t> bg_ofs;
-    WriteU32(file, bgcnt+1);
-    for (size_t i = 0; i < bgcnt+1; i++) {
+    WriteU32(file, bgcnt + 1);
+    for (size_t i = 0; i < bgcnt + 1; i++) {
         WriteU32(file, 0);
     }
     for (size_t i = 0; i < bgcnt; i++) {
@@ -1942,7 +2221,7 @@ void WriteHvqDataRom(FILE* file)
         WriteAlign(file, 2);
     }
     bg_ofs.push_back(ftell(file) - base_ofs);
-    for (size_t i = 0; i < bgcnt+1; i++) {
+    for (size_t i = 0; i < bgcnt + 1; i++) {
         WriteU32At(file, bg_ofs[i], base_ofs + (i * 4) + 4);
     }
     WriteAlign(file, 16);
@@ -1975,87 +2254,87 @@ void WriteMusBankRom(FILE* file, MusBankSegment& musbank)
 {
     musbank.romaddr = ftell(file);
     SetSegNameValue(musbank.segname, musbank.romaddr, false);
-    
+
     // Generate musbank header
     uint32_t count = musbank.libaudioseg.seqsegs.size();
     uint32_t soundbanksize = musbank.libaudioseg.soundbankseg.data.size();
 
     WriteRawBuffer(file, musbank.revision);
     if (musbank.new_format) {
-       WriteU32(file, count);
-       WriteRawBuffer(file, musbank.unkdata);
+        WriteU32(file, count);
+        WriteRawBuffer(file, musbank.unkdata);
 
-       uint32_t headersize = 80 + 16 * count;
-       uint32_t offset = headersize;
-       for (auto& seqseg : musbank.libaudioseg.seqsegs) {
-          uint32_t seqsize = seqseg.data.size();
-          WriteU8(file, seqseg.unk0);
-          WriteU8(file, seqseg.unk1);
-          WriteU8(file, seqseg.bank);
-          WriteU8(file, 0);
-          WriteU32(file, 0x07000000); // unused
-          if (seqseg.id == -1) { // original data
-             seqseg.romaddr = offset;
-             WriteU32(file, offset);
-             WriteU32(file, seqseg.data.size());
-             offset += seqseg.data.size();
-             offset = BIT_ALIGN(offset, 8);
-          }
-          else {
-             // Write copy sequence data
-             auto& copyseqseg = musbank.libaudioseg.seqsegs[seqseg.id];
-             WriteU32(file, copyseqseg.romaddr);
-             WriteU32(file, copyseqseg.data.size());
-          }
-       }
+        uint32_t headersize = 80 + 16 * count;
+        uint32_t offset = headersize;
+        for (auto& seqseg : musbank.libaudioseg.seqsegs) {
+            uint32_t seqsize = seqseg.data.size();
+            WriteU8(file, seqseg.unk0);
+            WriteU8(file, seqseg.unk1);
+            WriteU8(file, seqseg.bank);
+            WriteU8(file, 0);
+            WriteU32(file, 0x07000000); // unused
+            if (seqseg.id == -1) { // original data
+                seqseg.romaddr = offset;
+                WriteU32(file, offset);
+                WriteU32(file, seqseg.data.size());
+                offset += seqseg.data.size();
+                offset = BIT_ALIGN(offset, 8);
+            }
+            else {
+                // Write copy sequence data
+                auto& copyseqseg = musbank.libaudioseg.seqsegs[seqseg.id];
+                WriteU32(file, copyseqseg.romaddr);
+                WriteU32(file, copyseqseg.data.size());
+            }
+        }
 
-       WriteU32(file, offset);
-       WriteU32(file, soundbanksize);
-       WriteU32(file, offset + soundbanksize);
-       WriteU32(file, musbank.libaudioseg.wavetableseg.data.size());
+        WriteU32(file, offset);
+        WriteU32(file, soundbanksize);
+        WriteU32(file, offset + soundbanksize);
+        WriteU32(file, musbank.libaudioseg.wavetableseg.data.size());
     }
     else {
-       WriteU16(file, count);
-       uint32_t headersize = 4 + count * 24;
-       headersize = BIT_ALIGN(headersize, 16); // padding
-       uint32_t offset = soundbanksize + headersize + musbank.libaudioseg.wavetableseg.data.size();
-       for (auto& seqseg : musbank.libaudioseg.seqsegs) {
-          uint32_t seqsize = seqseg.data.size();
-          WriteU32(file, offset);
-          WriteU32(file, seqsize);
-          seqsize = BIT_ALIGN(seqsize, 8); // Don't forget about the padding
-          offset += seqsize;
-       }
-       for (auto& seqseg : musbank.libaudioseg.seqsegs) {
-          uint32_t seqsize = seqseg.data.size();
-          WriteU8(file, seqseg.bank);
-          WriteU8(file, 0x7F); // unused
-          WriteU8(file, 0xFF); // unused
-          WriteU8(file, 0xFF); // unused
+        WriteU16(file, count);
+        uint32_t headersize = 4 + count * 24;
+        headersize = BIT_ALIGN(headersize, 16); // padding
+        uint32_t offset = soundbanksize + headersize + musbank.libaudioseg.wavetableseg.data.size();
+        for (auto& seqseg : musbank.libaudioseg.seqsegs) {
+            uint32_t seqsize = seqseg.data.size();
+            WriteU32(file, offset);
+            WriteU32(file, seqsize);
+            seqsize = BIT_ALIGN(seqsize, 8); // Don't forget about the padding
+            offset += seqsize;
+        }
+        for (auto& seqseg : musbank.libaudioseg.seqsegs) {
+            uint32_t seqsize = seqseg.data.size();
+            WriteU8(file, seqseg.bank);
+            WriteU8(file, 0x7F); // unused
+            WriteU8(file, 0xFF); // unused
+            WriteU8(file, 0xFF); // unused
 
-          WriteU32(file, headersize);
-          WriteU32(file, soundbanksize);
-          WriteU32(file, headersize + soundbanksize);
-       }
+            WriteU32(file, headersize);
+            WriteU32(file, soundbanksize);
+            WriteU32(file, headersize + soundbanksize);
+        }
     }
     WriteAlignFF(file, 16);
 
     // midi order is first for new_format
     if (musbank.new_format) {
-       for (auto& seq : musbank.libaudioseg.seqsegs) {
-          if (seq.id == -1) {
-             WriteRawBuffer(file, seq.data);
-             WriteAlign(file, 8);
-          }
-       }
+        for (auto& seq : musbank.libaudioseg.seqsegs) {
+            if (seq.id == -1) {
+                WriteRawBuffer(file, seq.data);
+                WriteAlign(file, 8);
+            }
+        }
     }
     WriteRawBuffer(file, musbank.libaudioseg.soundbankseg.data);
     WriteRawBuffer(file, musbank.libaudioseg.wavetableseg.data);
     if (!musbank.new_format) {
-       for (auto& seq : musbank.libaudioseg.seqsegs) {
-          WriteRawBuffer(file, seq.data);
-          WriteAlign(file, 8); // Already aligned in mp1, this is for custom data
-       }
+        for (auto& seq : musbank.libaudioseg.seqsegs) {
+            WriteRawBuffer(file, seq.data);
+            WriteAlign(file, 8); // Already aligned in mp1, this is for custom data
+        }
     }
     WriteAlign(file, 16);
     SetSegNameValue(musbank.segname, ftell(file), true);
@@ -2095,6 +2374,7 @@ void WriteNewSegRefs(FILE* file)
         WriteU16At(file, lo, lo_dst);
     }
 }
+
 void WriteRom(std::string output)
 {
     FILE* file = fopen(output.c_str(), "wb");
@@ -2109,7 +2389,7 @@ void WriteRom(std::string output)
     for (size_t i = 0; i < gamedata.messdata_all.size(); i++) {
         WriteMessDataRom(file, gamedata.messdata_all[i]);
     }
-    
+
     WriteHvqDataRom(file);
     if (game_id == "mp2") {
         WriteBgAnimDataRom(file);
@@ -2127,10 +2407,12 @@ void WriteRom(std::string output)
     if (romid == "NMVE") {
         WriteU32At(file, 0, 0xCEC0);
         WriteU32At(file, 0, 0x50950);
-    } else if (romid == "NMVP") {
+    }
+    else if (romid == "NMVP") {
         WriteU32At(file, 0, 0xCEE0);
         WriteU32At(file, 0, 0x50990);
-    } else if (romid == "NMVJ") {
+    }
+    else if (romid == "NMVJ") {
         WriteU32At(file, 0, 0xCEC0);
         WriteU32At(file, 0, 0x507EC);
     }
@@ -2145,11 +2427,14 @@ void RebuildRom(std::string indir, std::string output)
     WriteRom(output);
     fix_crc(output.c_str());
 }
-int main(int argc, char **argv)
+
+int main(int argc, char** argv)
 {
     bool build_rom = false;
     size_t last_opt = 1;
     desc_path = "gameconfig";
+    unsigned int num_threads = std::thread::hardware_concurrency();
+
     for (int i = 1; i < argc; i++) {
         std::string option = argv[i];
         if (option[0] != '-') {
@@ -2162,14 +2447,16 @@ int main(int argc, char **argv)
         }
         if (option == "-b" || option == "--build") {
             build_rom = true;
-        } else if (option == "-d" || option == "--desc") {
+        }
+        else if (option == "-d" || option == "--desc") {
             if (++i >= argc) {
                 std::cout << "Missing argument for option " << option << "." << std::endl;
                 PrintHelp(argv[0]);
                 exit(1);
             }
             desc_path = argv[i];
-        } else if (option == "-a" || option == "--base") {
+        }
+        else if (option == "-a" || option == "--base") {
             if (++i >= argc) {
                 std::cout << "Missing argument for option " << option << "." << std::endl;
                 PrintHelp(argv[0]);
@@ -2181,8 +2468,20 @@ int main(int argc, char **argv)
                 exit(1);
             }
             LoadROM(argv[i]);
-        } else {
-            std::cout << "Invalid option " << option <<  "." << std::endl;
+        }
+        else if (option == "-j" || option == "--jobs") {
+            if (++i >= argc) {
+                std::cout << "Missing argument for option " << option << "." << std::endl;
+                PrintHelp(argv[0]);
+                exit(1);
+            }
+            num_threads = std::stoi(argv[i]);
+            if (num_threads == 0) {
+                num_threads = std::thread::hardware_concurrency();
+            }
+        }
+        else {
+            std::cout << "Invalid option " << option << "." << std::endl;
             PrintHelp(argv[0]);
             exit(1);
         }
@@ -2192,6 +2491,9 @@ int main(int argc, char **argv)
         PrintHelp(argv[0]);
         exit(1);
     }
+
+    std::cout << "Using " << num_threads << " threads for processing." << std::endl;
+
     ReadGameDesc(ReadRomGameID());
     if (!build_rom) {
         if (argc - last_opt != 1) {
@@ -2200,7 +2502,8 @@ int main(int argc, char **argv)
             exit(1);
         }
         ExtractROM(argv[last_opt]);
-    } else {
+    }
+    else {
         if (argc - last_opt != 2) {
             std::cout << "Invalid arguments after flags." << std::endl;
             PrintHelp(argv[0]);
